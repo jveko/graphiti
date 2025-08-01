@@ -1,0 +1,35 @@
+services:
+  neo4j:
+    image: neo4j:5.26.0
+    ports:
+      - "7474:7474" # HTTP
+      - "7687:7687" # Bolt
+    env_file:
+      - .env
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "wget", "-O", "/dev/null", "http://localhost:7474"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  graphiti-mcp:
+    image: zepai/knowledge-graph-mcp:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    ports:
+      - "8000:8000" # Expose the MCP server via HTTP for SSE transport
+    command: ["uv", "run", "graphiti_mcp_server.py", "--transport", "sse"]
+
+volumes:
+  neo4j_data:
+  neo4j_logs:

@@ -509,7 +509,6 @@ dependencies = [
 requires-dist = [
     { name = "azure-identity", specifier = ">=1.23.1" },
     { name = "graphiti-core" },
-    { name = "graphiti-core", specifier = ">=0.18.2" },
     { name = "mcp", specifier = ">=1.12.3" },
     { name = "openai", specifier = ">=1.98.0" },
 ]

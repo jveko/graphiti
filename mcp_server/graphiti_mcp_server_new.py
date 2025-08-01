@@ -23,6 +23,7 @@ from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder.azure_openai import AzureOpenAIEmbedderClient
 from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+from graphiti_core.embedder.voyage import VoyageAIEmbedder, VoyageAIEmbedderConfig
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.llm_client.azure_openai_client import AzureOpenAILLMClient
 from graphiti_core.llm_client.config import LLMConfig
@@ -358,6 +359,8 @@ class GraphitiEmbedderConfig(BaseModel):
     azure_openai_deployment_name: str | None = None
     azure_openai_api_version: str | None = None
     azure_openai_use_managed_identity: bool = False
+    voyage_api_key: str | None = None
+    embedder_provider: str | None = None  # 'voyage', 'azure', or 'openai'
 
     @classmethod
     def from_env(cls) -> 'GraphitiEmbedderConfig':
@@ -366,6 +369,16 @@ class GraphitiEmbedderConfig(BaseModel):
         # Get model from environment, or use default if not set or empty
         model_env = os.environ.get('EMBEDDER_MODEL_NAME', '')
         model = model_env if model_env.strip() else DEFAULT_EMBEDDER_MODEL
+
+        # Check for Voyage API key first
+        voyage_api_key = os.environ.get('VOYAGE_API_KEY', None)
+        if voyage_api_key:
+            # Voyage takes precedence if API key is set
+            return cls(
+                model=model,
+                voyage_api_key=voyage_api_key,
+                embedder_provider='voyage',
+            )
 
         azure_openai_endpoint = os.environ.get('AZURE_OPENAI_EMBEDDING_ENDPOINT', None)
         azure_openai_api_version = os.environ.get('AZURE_OPENAI_EMBEDDING_API_VERSION', None)
@@ -403,15 +416,24 @@ class GraphitiEmbedderConfig(BaseModel):
                 api_key=api_key,
                 azure_openai_api_version=azure_openai_api_version,
                 azure_openai_deployment_name=azure_openai_deployment_name,
+                embedder_provider='azure',
             )
         else:
             return cls(
                 model=model,
                 api_key=os.environ.get('OPENAI_API_KEY'),
+                embedder_provider='openai',
             )
 
     def create_client(self) -> EmbedderClient | None:
-        if self.azure_openai_endpoint is not None:
+        if self.embedder_provider == 'voyage' and self.voyage_api_key:
+            # Voyage AI setup
+            voyage_config = VoyageAIEmbedderConfig(
+                api_key=self.voyage_api_key,
+                embedding_model=self.model,
+            )
+            return VoyageAIEmbedder(config=voyage_config)
+        elif self.azure_openai_endpoint is not None:
             # Azure OpenAI API setup
             if self.azure_openai_use_managed_identity:
                 # Use managed identity for authentication

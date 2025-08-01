@@ -18,8 +18,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    networks:
-      - dokploy-network
 
   graphiti-mcp:
     image: zepai/knowledge-graph-mcp:latest
@@ -43,13 +41,7 @@ services:
     ports:
       - "8000:8000" # Expose the MCP server via HTTP for SSE transport
     command: ["uv", "run", "graphiti_mcp_server.py", "--transport", "sse"]
-    networks:
-      - dokploy-network
 
 volumes:
   neo4j_data:
   neo4j_logs:
-
-networks:
-  dokploy-network:
-    external: true

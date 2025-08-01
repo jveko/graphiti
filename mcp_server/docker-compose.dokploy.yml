@@ -32,7 +32,8 @@ services:
       neo4j:
         condition: service_healthy
     ports:
-      - "8000" # Expose the MCP server via HTTP for SSE transport
+      - "3000" # Expose the MCP server via HTTP for SSE transport
+      - "8000"
     command:
       [
         "uv",

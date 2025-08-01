@@ -662,6 +662,22 @@ async def initialize_graphiti():
 
         embedder_client = config.embedder.create_client()
 
+        # Check if we have OpenAI API key for cross-encoder (reranking)
+        # Cross-encoder is optional and defaults to OpenAI, so we disable it if no OpenAI key
+        openai_api_key = os.environ.get('OPENAI_API_KEY')
+        cross_encoder = None  # Disable cross-encoder if no OpenAI key available
+        
+        if openai_api_key:
+            # Only import and use OpenAI reranker if we have an API key
+            try:
+                from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+                cross_encoder = OpenAIRerankerClient()
+                logger.info('Cross-encoder (reranking) enabled with OpenAI')
+            except Exception as e:
+                logger.warning(f'Failed to initialize OpenAI cross-encoder: {e}')
+        else:
+            logger.info('Cross-encoder (reranking) disabled - no OpenAI API key available')
+
         # Initialize Graphiti client
         graphiti_client = Graphiti(
             uri=config.neo4j.uri,
@@ -669,6 +685,7 @@ async def initialize_graphiti():
             password=config.neo4j.password,
             llm_client=llm_client,
             embedder=embedder_client,
+            cross_encoder=cross_encoder,
             max_coroutines=SEMAPHORE_LIMIT,
         )
 

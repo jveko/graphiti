@@ -22,11 +22,13 @@ from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder.azure_openai import AzureOpenAIEmbedderClient
 from graphiti_core.embedder.client import EmbedderClient
+from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.embedder.voyage import VoyageAIEmbedder, VoyageAIEmbedderConfig
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.llm_client.azure_openai_client import AzureOpenAILLMClient
 from graphiti_core.llm_client.config import LLMConfig
+from graphiti_core.llm_client.gemini_client import GeminiClient
 from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.search.search_config_recipes import (
@@ -122,7 +124,7 @@ class Procedure(BaseModel):
     )
 
 
-ENTITY_TYPES: dict[str, BaseModel] = {
+ENTITY_TYPES: dict[str, type[BaseModel]] = {
     'Requirement': Requirement,  # type: ignore
     'Preference': Preference,  # type: ignore
     'Procedure': Procedure,  # type: ignore
@@ -201,6 +203,8 @@ class GraphitiLLMConfig(BaseModel):
     azure_openai_deployment_name: str | None = None
     azure_openai_api_version: str | None = None
     azure_openai_use_managed_identity: bool = False
+    google_api_key: str | None = None
+    llm_provider: str | None = None  # 'gemini', 'azure', or 'openai'
 
     @classmethod
     def from_env(cls) -> 'GraphitiLLMConfig':
@@ -212,6 +216,18 @@ class GraphitiLLMConfig(BaseModel):
         # Get small_model from environment, or use default if not set or empty
         small_model_env = os.environ.get('SMALL_MODEL_NAME', '')
         small_model = small_model_env if small_model_env.strip() else SMALL_LLM_MODEL
+
+        # Check for Google API key first (Gemini takes precedence)
+        google_api_key = os.environ.get('GOOGLE_API_KEY', None)
+        if google_api_key:
+            # Gemini takes precedence if API key is set
+            return cls(
+                google_api_key=google_api_key,
+                model=model,
+                small_model=small_model,
+                temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+                llm_provider='gemini',
+            )
 
         azure_openai_endpoint = os.environ.get('AZURE_OPENAI_ENDPOINT', None)
         azure_openai_api_version = os.environ.get('AZURE_OPENAI_API_VERSION', None)
@@ -237,6 +253,7 @@ class GraphitiLLMConfig(BaseModel):
                 model=model,
                 small_model=small_model,
                 temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+                llm_provider='openai',
             )
         else:
             # Setup for Azure OpenAI API
@@ -261,6 +278,7 @@ class GraphitiLLMConfig(BaseModel):
                 model=model,
                 small_model=small_model,
                 temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+                llm_provider='azure',
             )
 
     @classmethod
@@ -296,7 +314,16 @@ class GraphitiLLMConfig(BaseModel):
             LLMClient instance
         """
 
-        if self.azure_openai_endpoint is not None:
+        if self.llm_provider == 'gemini' and self.google_api_key:
+            # Gemini AI Studio setup
+            llm_client_config = LLMConfig(
+                api_key=self.google_api_key,
+                model=self.model,
+                small_model=self.small_model,
+                temperature=self.temperature,
+            )
+            return GeminiClient(config=llm_client_config)
+        elif self.azure_openai_endpoint is not None:
             # Azure OpenAI API setup
             if self.azure_openai_use_managed_identity:
                 # Use managed identity for authentication
@@ -360,7 +387,8 @@ class GraphitiEmbedderConfig(BaseModel):
     azure_openai_api_version: str | None = None
     azure_openai_use_managed_identity: bool = False
     voyage_api_key: str | None = None
-    embedder_provider: str | None = None  # 'voyage', 'azure', or 'openai'
+    google_api_key: str | None = None
+    embedder_provider: str | None = None  # 'voyage', 'gemini', 'azure', or 'openai'
 
     @classmethod
     def from_env(cls) -> 'GraphitiEmbedderConfig':
@@ -378,6 +406,16 @@ class GraphitiEmbedderConfig(BaseModel):
                 model=model,
                 voyage_api_key=voyage_api_key,
                 embedder_provider='voyage',
+            )
+
+        # Check for Google API key second (Gemini embeddings)
+        google_api_key = os.environ.get('GOOGLE_API_KEY', None)
+        if google_api_key:
+            # Gemini takes precedence over Azure/OpenAI if API key is set
+            return cls(
+                model=model,
+                google_api_key=google_api_key,
+                embedder_provider='gemini',
             )
 
         azure_openai_endpoint = os.environ.get('AZURE_OPENAI_EMBEDDING_ENDPOINT', None)
@@ -433,6 +471,13 @@ class GraphitiEmbedderConfig(BaseModel):
                 embedding_model=self.model,
             )
             return VoyageAIEmbedder(config=voyage_config)
+        elif self.embedder_provider == 'gemini' and self.google_api_key:
+            # Google Gemini embeddings setup
+            gemini_config = GeminiEmbedderConfig(
+                api_key=self.google_api_key,
+                embedding_model=self.model,
+            )
+            return GeminiEmbedder(config=gemini_config)
         elif self.azure_openai_endpoint is not None:
             # Azure OpenAI API setup
             if self.azure_openai_use_managed_identity:
@@ -1193,8 +1238,10 @@ def configure_mcp_server(mcp_config: MCPConfig) -> None:
     
     # Configure for streamable-http if needed
     if mcp_config.transport == 'streamable-http':
-        mcp.stateless_http = mcp_config.stateless
-        mcp.json_response = mcp_config.json_response
+        # Note: These attributes may not be available in all FastMCP versions
+        # mcp.stateless_http = mcp_config.stateless
+        # mcp.json_response = mcp_config.json_response
+        pass
 
 
 async def initialize_server() -> MCPConfig:

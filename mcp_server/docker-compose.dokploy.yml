@@ -2,13 +2,13 @@ services:
   neo4j:
     image: neo4j:5.26.0
     ports:
-      - "7474" # HTTP
-      - "7687" # Bolt
+      - "7474:7474" # HTTP
+      - "7687:7687" # Bolt
     environment:
       - NEO4J_AUTH=${NEO4J_USER}/${NEO4J_PASSWORD}
-      - NEO4J_ACCEPT_LICENSE_AGREEMENT=yes
-    env_file:
-      - .env
+      - NEO4J_server_memory_heap_initial__size=512m
+      - NEO4J_server_memory_heap_max__size=1G
+      - NEO4J_server_memory_pagecache_size=512m
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
@@ -25,7 +25,7 @@ services:
     image: zepai/knowledge-graph-mcp:latest
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile-new
     env_file:
       - .env
     depends_on:
@@ -33,7 +33,14 @@ services:
         condition: service_healthy
     ports:
       - "8000" # Expose the MCP server via HTTP for SSE transport
-    command: ["uv", "run", "graphiti_mcp_server.py", "--transport", "sse"]
+    command:
+      [
+        "uv",
+        "run",
+        "graphiti_mcp_server_new.py",
+        "--transport",
+        "streamable-http",
+      ]
     networks:
       - dokploy-network
 

@@ -662,21 +662,46 @@ async def initialize_graphiti():
 
         embedder_client = config.embedder.create_client()
 
-        # Check if we have OpenAI API key for cross-encoder (reranking)
-        # Cross-encoder is optional and defaults to OpenAI, so we disable it if no OpenAI key
-        openai_api_key = os.environ.get('OPENAI_API_KEY')
-        cross_encoder = None  # Disable cross-encoder if no OpenAI key available
+        # Check for cross-encoder (reranking) in priority order: Voyage → Gemini → OpenAI → None
+        cross_encoder = None
         
-        if openai_api_key:
-            # Only import and use OpenAI reranker if we have an API key
+        # 1. Try Voyage reranker first
+        voyage_api_key = os.environ.get('VOYAGE_API_KEY')
+        if voyage_api_key:
             try:
-                from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
-                cross_encoder = OpenAIRerankerClient()
-                logger.info('Cross-encoder (reranking) enabled with OpenAI')
+                from graphiti_core.cross_encoder.voyage_reranker_client import VoyageRerankerClient
+                cross_encoder = VoyageRerankerClient(api_key=voyage_api_key)
+                logger.info('Cross-encoder (reranking) enabled with Voyage AI')
             except Exception as e:
-                logger.warning(f'Failed to initialize OpenAI cross-encoder: {e}')
-        else:
-            logger.info('Cross-encoder (reranking) disabled - no OpenAI API key available')
+                logger.warning(f'Failed to initialize Voyage cross-encoder: {e}')
+        
+        # 2. Try Gemini reranker if no Voyage
+        if cross_encoder is None:
+            google_api_key = os.environ.get('GOOGLE_API_KEY')
+            if google_api_key:
+                try:
+                    from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
+                    from graphiti_core.llm_client.config import LLMConfig
+                    gemini_config = LLMConfig(api_key=google_api_key)
+                    cross_encoder = GeminiRerankerClient(config=gemini_config)
+                    logger.info('Cross-encoder (reranking) enabled with Gemini')
+                except Exception as e:
+                    logger.warning(f'Failed to initialize Gemini cross-encoder: {e}')
+        
+        # 3. Try OpenAI reranker as fallback
+        if cross_encoder is None:
+            openai_api_key = os.environ.get('OPENAI_API_KEY')
+            if openai_api_key:
+                try:
+                    from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+                    cross_encoder = OpenAIRerankerClient()
+                    logger.info('Cross-encoder (reranking) enabled with OpenAI')
+                except Exception as e:
+                    logger.warning(f'Failed to initialize OpenAI cross-encoder: {e}')
+        
+        # 4. No reranker available
+        if cross_encoder is None:
+            logger.info('Cross-encoder (reranking) disabled - no API keys available for Voyage/Gemini/OpenAI')
 
         # Initialize Graphiti client
         graphiti_client = Graphiti(

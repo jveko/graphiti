@@ -39,6 +39,7 @@ services:
         "uv",
         "run",
         "graphiti_mcp_server_new.py",
+        "--use-custom-entities",
         "--transport",
         "streamable-http",
       ]

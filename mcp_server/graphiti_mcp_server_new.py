@@ -32,6 +32,8 @@ from graphiti_core.llm_client.gemini_client import GeminiClient
 from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.search.search_config_recipes import (
+    COMBINED_HYBRID_SEARCH_CROSS_ENCODER,
+    NODE_HYBRID_SEARCH_CROSS_ENCODER,
     NODE_HYBRID_SEARCH_NODE_DISTANCE,
     NODE_HYBRID_SEARCH_RRF,
 )
@@ -947,19 +949,32 @@ async def search_memory_nodes(
     group_ids: list[str] | None = None,
     max_nodes: int = 10,
     center_node_uuid: str | None = None,
-    entity: str = '',  # cursor seems to break with None
+    entity: str | None = None,
 ) -> NodeSearchResponse | ErrorResponse:
-    """Search the graph memory for relevant node summaries.
+    """Search the graph memory for relevant node summaries using advanced hybrid search.
     These contain a summary of all of a node's relationships with other nodes.
-
-    Note: entity is a single entity type to filter results (permitted: "Preference", "Procedure").
+    
+    Uses sophisticated search methodologies including BM25, cosine similarity, and adaptive 
+    reranking strategies:
+    - Cross-encoder reranking (when available) for highest quality semantic relevance
+    - Node distance reranking when centering around a specific node
+    - RRF (Reciprocal Rank Fusion) as a fast fallback for hybrid search
+    
+    The search automatically detects available reranking capabilities and selects the 
+    optimal configuration for best results.
 
     Args:
         query: The search query
         group_ids: Optional list of group IDs to filter results
         max_nodes: Maximum number of nodes to return (default: 10)
-        center_node_uuid: Optional UUID of a node to center the search around
-        entity: Optional single entity type to filter results (permitted: "Preference", "Procedure")
+        center_node_uuid: Optional UUID of a node to center the search around (enables proximity-based reranking)
+        entity: Optional entity type filter. Valid types: "Requirement", "Preference", "Procedure"
+        
+    Returns:
+        NodeSearchResponse with matching nodes and their summaries, or ErrorResponse on failure
+        
+    Raises:
+        ErrorResponse: If entity type is invalid or if Graphiti client is not initialized
     """
     global graphiti_client
 
@@ -972,16 +987,37 @@ async def search_memory_nodes(
             group_ids if group_ids is not None else [config.group_id] if config.group_id else []
         )
 
-        # Configure the search
-        if center_node_uuid is not None:
-            search_config = NODE_HYBRID_SEARCH_NODE_DISTANCE.model_copy(deep=True)
-        else:
-            search_config = NODE_HYBRID_SEARCH_RRF.model_copy(deep=True)
-        search_config.limit = max_nodes
+        # Validate entity type if provided
+        if entity is not None and entity not in ENTITY_TYPES:
+            available_types = ', '.join(f'"{t}"' for t in ENTITY_TYPES)
+            # Suggest similar entity types for possible typos
+            suggestion = ""
+            if entity.lower() in ['pref', 'preference', 'preferences']:
+                suggestion = ' Did you mean "Preference"?'
+            elif entity.lower() in ['proc', 'procedure', 'procedures']:
+                suggestion = ' Did you mean "Procedure"?'
+            elif entity.lower() in ['req', 'requirement', 'requirements']:
+                suggestion = ' Did you mean "Requirement"?'
+                
+            return ErrorResponse(
+                error=f'Invalid entity type "{entity}". Available types: {available_types}.{suggestion}'
+            )
+        
+        # Handle entity filtering with graceful degradation
+        entity_filter_warning = None
+        if entity is not None and not config.use_custom_entities:
+            # Instead of failing, fall back to unfiltered search with warning
+            entity_filter_warning = (
+                f'Entity filtering for "{entity}" skipped: custom entities not enabled. '
+                f'Showing all nodes instead. To enable: restart server with --use-custom-entities flag.'
+            )
+            entity = None  # Disable entity filtering
+            logger.warning(f'Graceful degradation: {entity_filter_warning}')
 
         filters = SearchFilters()
-        if entity != '':
+        if entity is not None:
             filters.node_labels = [entity]
+            logger.debug(f'Applied entity filter: {entity}')
 
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
@@ -989,17 +1025,63 @@ async def search_memory_nodes(
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
 
-        # Perform the search using the _search method
-        search_results = await client._search(
+        # Configure the search with intelligent strategy selection
+        # Check if cross-encoder is available by verifying if graphiti client has a cross_encoder
+        has_cross_encoder = (
+            hasattr(client, 'cross_encoder') and 
+            client.cross_encoder is not None
+        )
+        
+        # Smart search configuration selection based on context and available capabilities
+        if center_node_uuid is not None:
+            # Use node distance reranking when centering around a specific node for proximity-based results
+            search_config = NODE_HYBRID_SEARCH_NODE_DISTANCE.model_copy(deep=True)
+            search_strategy = "node-distance (proximity-based)"
+        elif has_cross_encoder:
+            # Use cross-encoder for best semantic quality when available (slower but more accurate)
+            search_config = NODE_HYBRID_SEARCH_CROSS_ENCODER.model_copy(deep=True)
+            search_strategy = "cross-encoder (high-quality semantic)"
+        else:
+            # Fallback to RRF for fast hybrid search when cross-encoder unavailable
+            search_config = NODE_HYBRID_SEARCH_RRF.model_copy(deep=True)
+            search_strategy = "RRF hybrid (fast)"
+        
+        search_config.limit = max_nodes
+        
+        logger.debug(f'Search config: {search_strategy}, entity_filter: {entity}, groups: {effective_group_ids}')
+
+        # Perform the search using the search_ method with timing
+        import time
+        start_time = time.time()
+        
+        search_results = await client.search_(
             query=query,
             config=search_config,
             group_ids=effective_group_ids,
             center_node_uuid=center_node_uuid,
             search_filter=filters,
         )
-
+        
+        search_duration = time.time() - start_time
+        logger.info(f'Search completed: {len(search_results.nodes)} nodes found in {search_duration:.2f}s using {search_strategy}')
+        
+        # Enhanced logging for debugging entity filtering
+        if entity is not None and len(search_results.nodes) == 0:
+            logger.warning(f'Entity filter "{entity}" returned no results. Suggestions:\n'
+                          f'1. Use list_node_labels tool to check existing entity types\n'
+                          f'2. Verify --use-custom-entities was enabled when adding data\n'
+                          f'3. Try searching without entity filter first')
+        elif entity is not None:
+            entity_types_found = set()
+            for node in search_results.nodes:
+                entity_types_found.update([label for label in node.labels if label != 'Entity'])
+            logger.debug(f'Entity types in results: {list(entity_types_found)}')
+            
         if not search_results.nodes:
-            return NodeSearchResponse(message='No relevant nodes found', nodes=[])
+            suggestion_msg = "No relevant nodes found"
+            if entity is not None:
+                suggestion_msg += f" with entity type '{entity}'. Try using list_node_labels tool to debug."
+            return NodeSearchResponse(message=suggestion_msg, nodes=[])
 
         # Format the node results
         formatted_nodes: list[NodeResult] = [
@@ -1015,7 +1097,14 @@ async def search_memory_nodes(
             for node in search_results.nodes
         ]
 
-        return NodeSearchResponse(message='Nodes retrieved successfully', nodes=formatted_nodes)
+        # Prepare response message with any warnings
+        response_message = 'Nodes retrieved successfully'
+        if entity_filter_warning:
+            response_message = f'⚠️ {entity_filter_warning} Found {len(formatted_nodes)} nodes.'
+        elif len(formatted_nodes) > 0:
+            response_message = f'Found {len(formatted_nodes)} nodes'
+            
+        return NodeSearchResponse(message=response_message, nodes=formatted_nodes)
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error searching nodes: {error_msg}')
@@ -1217,6 +1306,137 @@ async def get_episodes(
         error_msg = str(e)
         logger.error(f'Error getting episodes: {error_msg}')
         return ErrorResponse(error=f'Error getting episodes: {error_msg}')
+
+
+@mcp.tool()
+async def list_node_labels(
+    group_id: str | None = None,
+    entity_type: str | None = None,
+    limit: int = 50
+) -> dict[str, Any] | ErrorResponse:
+    """List existing nodes with their labels for debugging entity filtering.
+    
+    This tool helps diagnose why entity filtering might not be working by showing
+    what labels are actually stored in the database, with optional filtering and statistics.
+    
+    Args:
+        group_id: Optional group ID to filter results. If not provided, uses default group_id.
+        entity_type: Optional entity type to filter by (e.g., "Requirement", "Preference", "Procedure")
+        limit: Maximum number of nodes to return (default: 50, max: 200)
+        
+    Returns:
+        Dictionary with node information, entity type counts, and metadata
+    """
+    global graphiti_client
+    
+    if graphiti_client is None:
+        return ErrorResponse(error='Graphiti client not initialized')
+    
+    try:
+        # Validate inputs
+        if limit > 200:
+            limit = 200
+        if limit < 1:
+            limit = 50
+            
+        # Validate entity_type if provided
+        if entity_type is not None and entity_type not in ENTITY_TYPES:
+            available_types = ', '.join(f'"{t}"' for t in ENTITY_TYPES)
+            return ErrorResponse(
+                error=f'Invalid entity_type "{entity_type}". Available types: {available_types}'
+            )
+        
+        # Use the provided group_id or fall back to the default from config
+        effective_group_id = group_id if group_id is not None else config.group_id
+        
+        if not isinstance(effective_group_id, str):
+            return ErrorResponse(error='Group ID must be a string')
+        
+        # We've already checked that graphiti_client is not None above
+        assert graphiti_client is not None
+        
+        # Use cast to help the type checker understand that graphiti_client is not None
+        client = cast(Graphiti, graphiti_client)
+        
+        # Get filtered nodes - handle entity_type filtering via WHERE clause to avoid f-string
+        if entity_type is not None:
+            records, _, _ = await client.driver.execute_query(
+                """
+                MATCH (n:Entity {group_id: $group_id})
+                WHERE $entity_type IN labels(n)
+                RETURN n.uuid as uuid, n.name as name, labels(n) as labels, 
+                       n.created_at as created_at, n.summary as summary
+                ORDER BY n.created_at DESC
+                LIMIT $limit
+                """,
+                group_id=effective_group_id,
+                entity_type=entity_type,
+                limit=limit,
+                routing_='r'
+            )
+        else:
+            records, _, _ = await client.driver.execute_query(
+                """
+                MATCH (n:Entity {group_id: $group_id})
+                RETURN n.uuid as uuid, n.name as name, labels(n) as labels, 
+                       n.created_at as created_at, n.summary as summary
+                ORDER BY n.created_at DESC
+                LIMIT $limit
+                """,
+                group_id=effective_group_id,
+                limit=limit,
+                routing_='r'
+            )
+        
+        # Get entity type counts
+        count_records, _, _ = await client.driver.execute_query(
+            """
+            MATCH (n:Entity {group_id: $group_id})
+            WITH n, [label IN labels(n) WHERE label <> 'Entity'] as entity_labels
+            UNWIND CASE WHEN size(entity_labels) = 0 THEN ['Untyped'] ELSE entity_labels END as entity_type
+            RETURN entity_type, count(*) as count
+            ORDER BY count DESC
+            """,
+            group_id=effective_group_id,
+            routing_='r'
+        )
+        
+        entity_counts = {}
+        total_nodes = 0
+        for record in count_records:
+            entity_type_name = record['entity_type']
+            count = record['count']
+            entity_counts[entity_type_name] = count
+            total_nodes += count
+        
+        nodes_info = []
+        for record in records:
+            # Extract entity types (exclude 'Entity' base label)
+            entity_labels = [label for label in record['labels'] if label != 'Entity']
+            nodes_info.append({
+                'uuid': record['uuid'],
+                'name': record['name'],
+                'labels': record['labels'],
+                'entity_types': entity_labels,
+                'created_at': record['created_at'].isoformat() if record['created_at'] else None,
+                'summary': record['summary'][:100] + '...' if record['summary'] and len(record['summary']) > 100 else record['summary']
+            })
+        
+        filter_msg = f" matching entity type '{entity_type}'" if entity_type else ""
+        
+        return {
+            'message': f'Found {len(nodes_info)} nodes{filter_msg} in group {effective_group_id} (showing up to {limit})',
+            'nodes': nodes_info,
+            'entity_type_counts': entity_counts,
+            'total_nodes_in_group': total_nodes,
+            'custom_entities_enabled': config.use_custom_entities,
+            'filter_applied': entity_type
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error listing node labels: {error_msg}')
+        return ErrorResponse(error=f'Error listing node labels: {error_msg}')
 
 
 @mcp.tool()

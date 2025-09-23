@@ -39,6 +39,10 @@ COPY mcp_server/pyproject.toml mcp_server/uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
+# Install local graphiti-core with required extras
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install /workspace[voyageai,google-genai,falkordb]
+
 # Copy application code
 COPY mcp_server/graphiti_mcp_server_new.py ./
 

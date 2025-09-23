@@ -8,31 +8,26 @@ import asyncio
 import logging
 import os
 import sys
-from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, TypedDict, cast
 
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-from openai import AsyncAzureOpenAI
 from pydantic import BaseModel, Field
 
 from graphiti_core import Graphiti
+from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
-from graphiti_core.embedder.azure_openai import AzureOpenAIEmbedderClient
 from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
 from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.embedder.voyage import VoyageAIEmbedder, VoyageAIEmbedderConfig
 from graphiti_core.llm_client import LLMClient
-from graphiti_core.llm_client.azure_openai_client import AzureOpenAILLMClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.gemini_client import GeminiClient
 from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.search.search_config_recipes import (
-    COMBINED_HYBRID_SEARCH_CROSS_ENCODER,
     NODE_HYBRID_SEARCH_CROSS_ENCODER,
     NODE_HYBRID_SEARCH_NODE_DISTANCE,
     NODE_HYBRID_SEARCH_RRF,
@@ -172,20 +167,13 @@ class StatusResponse(TypedDict):
     message: str
 
 
-def create_azure_credential_token_provider() -> Callable[[], str]:
-    credential = DefaultAzureCredential()
-    token_provider = get_bearer_token_provider(
-        credential, 'https://cognitiveservices.azure.com/.default'
-    )
-    return token_provider
-
 
 # Server configuration classes
 # The configuration system has a hierarchy:
 # - GraphitiConfig is the top-level configuration
-#   - LLMConfig handles all OpenAI/LLM related settings
-#   - EmbedderConfig manages embedding settings
-#   - Neo4jConfig manages database connection details
+#   - LLMConfig handles LLM provider settings (Gemini, OpenRouter, OpenAI)
+#   - EmbedderConfig manages embedding settings (Voyage, Gemini, OpenAI)
+#   - FalkorDBConfig manages database connection details
 #   - Various other settings like group_id and feature flags
 # Configuration values are loaded from:
 # 1. Default values in the class definitions
@@ -201,12 +189,12 @@ class GraphitiLLMConfig(BaseModel):
     model: str = DEFAULT_LLM_MODEL
     small_model: str = SMALL_LLM_MODEL
     temperature: float = 0.0
-    azure_openai_endpoint: str | None = None
-    azure_openai_deployment_name: str | None = None
-    azure_openai_api_version: str | None = None
-    azure_openai_use_managed_identity: bool = False
     google_api_key: str | None = None
-    llm_provider: str | None = None  # 'gemini', 'azure', or 'openai'
+    openrouter_api_key: str | None = None
+    openrouter_provider_order: list[str] | None = None
+    openrouter_allow_fallbacks: bool = True
+    openrouter_provider_sort: str | None = None  # 'price', 'throughput', 'latency'
+    llm_provider: str | None = None  # 'gemini', 'openrouter', or 'openai'
 
     @classmethod
     def from_env(cls) -> 'GraphitiLLMConfig':
@@ -231,57 +219,49 @@ class GraphitiLLMConfig(BaseModel):
                 llm_provider='gemini',
             )
 
-        azure_openai_endpoint = os.environ.get('AZURE_OPENAI_ENDPOINT', None)
-        azure_openai_api_version = os.environ.get('AZURE_OPENAI_API_VERSION', None)
-        azure_openai_deployment_name = os.environ.get('AZURE_OPENAI_DEPLOYMENT_NAME', None)
-        azure_openai_use_managed_identity = (
-            os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
+        # Check for OpenRouter API key second
+        openrouter_api_key = os.environ.get('OPENROUTER_API_KEY', None)
+        if openrouter_api_key:
+            # OpenRouter takes precedence over OpenAI if API key is set
+            # Parse provider order from comma-separated string
+            provider_order_str = os.environ.get('OPENROUTER_PROVIDER_ORDER', None)
+            provider_order = provider_order_str.split(',') if provider_order_str else None
+
+            # Parse allow fallbacks
+            allow_fallbacks = os.environ.get('OPENROUTER_ALLOW_FALLBACKS', 'true').lower() == 'true'
+
+            # Get provider sort preference
+            provider_sort = os.environ.get('OPENROUTER_PROVIDER_SORT', None)
+
+            return cls(
+                openrouter_api_key=openrouter_api_key,
+                openrouter_provider_order=provider_order,
+                openrouter_allow_fallbacks=allow_fallbacks,
+                openrouter_provider_sort=provider_sort,
+                model=model,
+                small_model=small_model,
+                temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+                llm_provider='openrouter',
+            )
+
+        # Setup for OpenAI API (default fallback)
+        # Log if empty model was provided
+        if model_env == '':
+            logger.debug(
+                f'MODEL_NAME environment variable not set, using default: {DEFAULT_LLM_MODEL}'
+            )
+        elif not model_env.strip():
+            logger.warning(
+                f'Empty MODEL_NAME environment variable, using default: {DEFAULT_LLM_MODEL}'
+            )
+
+        return cls(
+            api_key=os.environ.get('OPENAI_API_KEY'),
+            model=model,
+            small_model=small_model,
+            temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+            llm_provider='openai',
         )
-
-        if azure_openai_endpoint is None:
-            # Setup for OpenAI API
-            # Log if empty model was provided
-            if model_env == '':
-                logger.debug(
-                    f'MODEL_NAME environment variable not set, using default: {DEFAULT_LLM_MODEL}'
-                )
-            elif not model_env.strip():
-                logger.warning(
-                    f'Empty MODEL_NAME environment variable, using default: {DEFAULT_LLM_MODEL}'
-                )
-
-            return cls(
-                api_key=os.environ.get('OPENAI_API_KEY'),
-                model=model,
-                small_model=small_model,
-                temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
-                llm_provider='openai',
-            )
-        else:
-            # Setup for Azure OpenAI API
-            # Log if empty deployment name was provided
-            if azure_openai_deployment_name is None:
-                logger.error('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
-
-                raise ValueError('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
-            if not azure_openai_use_managed_identity:
-                # api key
-                api_key = os.environ.get('OPENAI_API_KEY', None)
-            else:
-                # Managed identity
-                api_key = None
-
-            return cls(
-                azure_openai_use_managed_identity=azure_openai_use_managed_identity,
-                azure_openai_endpoint=azure_openai_endpoint,
-                api_key=api_key,
-                azure_openai_api_version=azure_openai_api_version,
-                azure_openai_deployment_name=azure_openai_deployment_name,
-                model=model,
-                small_model=small_model,
-                temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
-                llm_provider='azure',
-            )
 
     @classmethod
     def from_cli_and_env(cls, args: argparse.Namespace) -> 'GraphitiLLMConfig':
@@ -307,6 +287,17 @@ class GraphitiLLMConfig(BaseModel):
         if hasattr(args, 'temperature') and args.temperature is not None:
             config.temperature = args.temperature
 
+        if hasattr(args, 'openrouter_provider_order') and args.openrouter_provider_order:
+            config.openrouter_provider_order = args.openrouter_provider_order.split(',')
+
+        if hasattr(args, 'openrouter_no_fallbacks') and args.openrouter_no_fallbacks:
+            config.openrouter_allow_fallbacks = False
+        elif hasattr(args, 'openrouter_allow_fallbacks') and args.openrouter_allow_fallbacks:
+            config.openrouter_allow_fallbacks = True
+
+        if hasattr(args, 'openrouter_provider_sort') and args.openrouter_provider_sort:
+            config.openrouter_provider_sort = args.openrouter_provider_sort
+
         return config
 
     def create_client(self) -> LLMClient:
@@ -325,43 +316,23 @@ class GraphitiLLMConfig(BaseModel):
                 temperature=self.temperature,
             )
             return GeminiClient(config=llm_client_config)
-        elif self.azure_openai_endpoint is not None:
-            # Azure OpenAI API setup
-            if self.azure_openai_use_managed_identity:
-                # Use managed identity for authentication
-                token_provider = create_azure_credential_token_provider()
-                return AzureOpenAILLMClient(
-                    azure_client=AsyncAzureOpenAI(
-                        azure_endpoint=self.azure_openai_endpoint,
-                        azure_deployment=self.azure_openai_deployment_name,
-                        api_version=self.azure_openai_api_version,
-                        azure_ad_token_provider=token_provider,
-                    ),
-                    config=LLMConfig(
-                        api_key=self.api_key,
-                        model=self.model,
-                        small_model=self.small_model,
-                        temperature=self.temperature,
-                    ),
-                )
-            elif self.api_key:
-                # Use API key for authentication
-                return AzureOpenAILLMClient(
-                    azure_client=AsyncAzureOpenAI(
-                        azure_endpoint=self.azure_openai_endpoint,
-                        azure_deployment=self.azure_openai_deployment_name,
-                        api_version=self.azure_openai_api_version,
-                        api_key=self.api_key,
-                    ),
-                    config=LLMConfig(
-                        api_key=self.api_key,
-                        model=self.model,
-                        small_model=self.small_model,
-                        temperature=self.temperature,
-                    ),
-                )
-            else:
-                raise ValueError('OPENAI_API_KEY must be set when using Azure OpenAI API')
+        elif self.llm_provider == 'openrouter' and self.openrouter_api_key:
+            # OpenRouter setup using custom client for provider routing
+            from graphiti_core.llm_client.openrouter_client import OpenRouterClient
+
+            llm_client_config = LLMConfig(
+                api_key=self.openrouter_api_key,
+                base_url='https://openrouter.ai/api/v1',
+                model=self.model,
+                small_model=self.small_model,
+                temperature=self.temperature,
+            )
+            return OpenRouterClient(
+                config=llm_client_config,
+                provider_order=self.openrouter_provider_order,
+                allow_fallbacks=self.openrouter_allow_fallbacks,
+                provider_sort=self.openrouter_provider_sort,
+            )
 
         if not self.api_key:
             raise ValueError('OPENAI_API_KEY must be set when using OpenAI API')
@@ -384,13 +355,9 @@ class GraphitiEmbedderConfig(BaseModel):
 
     model: str = DEFAULT_EMBEDDER_MODEL
     api_key: str | None = None
-    azure_openai_endpoint: str | None = None
-    azure_openai_deployment_name: str | None = None
-    azure_openai_api_version: str | None = None
-    azure_openai_use_managed_identity: bool = False
     voyage_api_key: str | None = None
     google_api_key: str | None = None
-    embedder_provider: str | None = None  # 'voyage', 'gemini', 'azure', or 'openai'
+    embedder_provider: str | None = None  # 'voyage', 'gemini', or 'openai'
 
     @classmethod
     def from_env(cls) -> 'GraphitiEmbedderConfig':
@@ -413,57 +380,19 @@ class GraphitiEmbedderConfig(BaseModel):
         # Check for Google API key second (Gemini embeddings)
         google_api_key = os.environ.get('GOOGLE_API_KEY', None)
         if google_api_key:
-            # Gemini takes precedence over Azure/OpenAI if API key is set
+            # Gemini takes precedence over OpenAI if API key is set
             return cls(
                 model=model,
                 google_api_key=google_api_key,
                 embedder_provider='gemini',
             )
 
-        azure_openai_endpoint = os.environ.get('AZURE_OPENAI_EMBEDDING_ENDPOINT', None)
-        azure_openai_api_version = os.environ.get('AZURE_OPENAI_EMBEDDING_API_VERSION', None)
-        azure_openai_deployment_name = os.environ.get(
-            'AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME', None
+        # Default to OpenAI embeddings
+        return cls(
+            model=model,
+            api_key=os.environ.get('OPENAI_API_KEY'),
+            embedder_provider='openai',
         )
-        azure_openai_use_managed_identity = (
-            os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
-        )
-        if azure_openai_endpoint is not None:
-            # Setup for Azure OpenAI API
-            # Log if empty deployment name was provided
-            azure_openai_deployment_name = os.environ.get(
-                'AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME', None
-            )
-            if azure_openai_deployment_name is None:
-                logger.error('AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME environment variable not set')
-
-                raise ValueError(
-                    'AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME environment variable not set'
-                )
-
-            if not azure_openai_use_managed_identity:
-                # api key
-                api_key = os.environ.get('AZURE_OPENAI_EMBEDDING_API_KEY', None) or os.environ.get(
-                    'OPENAI_API_KEY', None
-                )
-            else:
-                # Managed identity
-                api_key = None
-
-            return cls(
-                azure_openai_use_managed_identity=azure_openai_use_managed_identity,
-                azure_openai_endpoint=azure_openai_endpoint,
-                api_key=api_key,
-                azure_openai_api_version=azure_openai_api_version,
-                azure_openai_deployment_name=azure_openai_deployment_name,
-                embedder_provider='azure',
-            )
-        else:
-            return cls(
-                model=model,
-                api_key=os.environ.get('OPENAI_API_KEY'),
-                embedder_provider='openai',
-            )
 
     def create_client(self) -> EmbedderClient | None:
         if self.embedder_provider == 'voyage' and self.voyage_api_key:
@@ -480,34 +409,6 @@ class GraphitiEmbedderConfig(BaseModel):
                 embedding_model=self.model,
             )
             return GeminiEmbedder(config=gemini_config)
-        elif self.azure_openai_endpoint is not None:
-            # Azure OpenAI API setup
-            if self.azure_openai_use_managed_identity:
-                # Use managed identity for authentication
-                token_provider = create_azure_credential_token_provider()
-                return AzureOpenAIEmbedderClient(
-                    azure_client=AsyncAzureOpenAI(
-                        azure_endpoint=self.azure_openai_endpoint,
-                        azure_deployment=self.azure_openai_deployment_name,
-                        api_version=self.azure_openai_api_version,
-                        azure_ad_token_provider=token_provider,
-                    ),
-                    model=self.model,
-                )
-            elif self.api_key:
-                # Use API key for authentication
-                return AzureOpenAIEmbedderClient(
-                    azure_client=AsyncAzureOpenAI(
-                        azure_endpoint=self.azure_openai_endpoint,
-                        azure_deployment=self.azure_openai_deployment_name,
-                        api_version=self.azure_openai_api_version,
-                        api_key=self.api_key,
-                    ),
-                    model=self.model,
-                )
-            else:
-                logger.error('OPENAI_API_KEY must be set when using Azure OpenAI API')
-                return None
         else:
             # OpenAI API setup
             if not self.api_key:
@@ -518,20 +419,24 @@ class GraphitiEmbedderConfig(BaseModel):
             return OpenAIEmbedder(config=embedder_config)
 
 
-class Neo4jConfig(BaseModel):
-    """Configuration for Neo4j database connection."""
+class FalkorDBConfig(BaseModel):
+    """Configuration for FalkorDB database connection."""
 
-    uri: str = 'bolt://localhost:7687'
-    user: str = 'neo4j'
-    password: str = 'password'
+    host: str = 'localhost'
+    port: int = 6379
+    username: str | None = None
+    password: str | None = None
+    database: str = 'default_db'
 
     @classmethod
-    def from_env(cls) -> 'Neo4jConfig':
-        """Create Neo4j configuration from environment variables."""
+    def from_env(cls) -> 'FalkorDBConfig':
+        """Create FalkorDB configuration from environment variables."""
         return cls(
-            uri=os.environ.get('NEO4J_URI', 'bolt://localhost:7687'),
-            user=os.environ.get('NEO4J_USER', 'neo4j'),
-            password=os.environ.get('NEO4J_PASSWORD', 'password'),
+            host=os.environ.get('FALKORDB_HOST', 'localhost'),
+            port=int(os.environ.get('FALKORDB_PORT', '6379')),
+            username=os.environ.get('FALKORDB_USERNAME'),
+            password=os.environ.get('FALKORDB_PASSWORD'),
+            database=os.environ.get('FALKORDB_DATABASE', 'default_db'),
         )
 
 
@@ -543,7 +448,7 @@ class GraphitiConfig(BaseModel):
 
     llm: GraphitiLLMConfig = Field(default_factory=GraphitiLLMConfig)
     embedder: GraphitiEmbedderConfig = Field(default_factory=GraphitiEmbedderConfig)
-    neo4j: Neo4jConfig = Field(default_factory=Neo4jConfig)
+    falkordb: FalkorDBConfig = Field(default_factory=FalkorDBConfig)
     group_id: str | None = None
     use_custom_entities: bool = False
     destroy_graph: bool = False
@@ -554,7 +459,7 @@ class GraphitiConfig(BaseModel):
         return cls(
             llm=GraphitiLLMConfig.from_env(),
             embedder=GraphitiEmbedderConfig.from_env(),
-            neo4j=Neo4jConfig.from_env(),
+            falkordb=FalkorDBConfig.from_env(),
         )
 
     @classmethod
@@ -658,15 +563,24 @@ async def initialize_graphiti():
             # If custom entities are enabled, we must have an LLM client
             raise ValueError('OPENAI_API_KEY must be set when custom entities are enabled')
 
-        # Validate Neo4j configuration
-        if not config.neo4j.uri or not config.neo4j.user or not config.neo4j.password:
-            raise ValueError('NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must be set')
+        # Validate FalkorDB configuration
+        if not config.falkordb.host:
+            raise ValueError('FALKORDB_HOST must be set')
+
+        # Create FalkorDB driver
+        falkor_driver = FalkorDriver(
+            host=config.falkordb.host,
+            port=config.falkordb.port,
+            username=config.falkordb.username,
+            password=config.falkordb.password,
+            database=config.falkordb.database,
+        )
 
         embedder_client = config.embedder.create_client()
 
         # Check for cross-encoder (reranking) in priority order: Voyage → Gemini → OpenAI → None
         cross_encoder = None
-        
+
         # 1. Try Voyage reranker first
         voyage_api_key = os.environ.get('VOYAGE_API_KEY')
         if voyage_api_key:
@@ -676,40 +590,42 @@ async def initialize_graphiti():
                 logger.info('Cross-encoder (reranking) enabled with Voyage AI')
             except Exception as e:
                 logger.warning(f'Failed to initialize Voyage cross-encoder: {e}')
-        
+
         # 2. Try Gemini reranker if no Voyage
         if cross_encoder is None:
             google_api_key = os.environ.get('GOOGLE_API_KEY')
             if google_api_key:
                 try:
-                    from graphiti_core.cross_encoder.gemini_reranker_client import GeminiRerankerClient
+                    from graphiti_core.cross_encoder.gemini_reranker_client import (
+                        GeminiRerankerClient,
+                    )
                     from graphiti_core.llm_client.config import LLMConfig
                     gemini_config = LLMConfig(api_key=google_api_key)
                     cross_encoder = GeminiRerankerClient(config=gemini_config)
                     logger.info('Cross-encoder (reranking) enabled with Gemini')
                 except Exception as e:
                     logger.warning(f'Failed to initialize Gemini cross-encoder: {e}')
-        
+
         # 3. Try OpenAI reranker as fallback
         if cross_encoder is None:
             openai_api_key = os.environ.get('OPENAI_API_KEY')
             if openai_api_key:
                 try:
-                    from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+                    from graphiti_core.cross_encoder.openai_reranker_client import (
+                        OpenAIRerankerClient,
+                    )
                     cross_encoder = OpenAIRerankerClient()
                     logger.info('Cross-encoder (reranking) enabled with OpenAI')
                 except Exception as e:
                     logger.warning(f'Failed to initialize OpenAI cross-encoder: {e}')
-        
+
         # 4. No reranker available
         if cross_encoder is None:
             logger.info('Cross-encoder (reranking) disabled - no API keys available for Voyage/Gemini/OpenAI')
 
-        # Initialize Graphiti client
+        # Initialize Graphiti client with FalkorDB driver
         graphiti_client = Graphiti(
-            uri=config.neo4j.uri,
-            user=config.neo4j.user,
-            password=config.neo4j.password,
+            graph_driver=falkor_driver,
             llm_client=llm_client,
             embedder=embedder_client,
             cross_encoder=cross_encoder,
@@ -953,14 +869,14 @@ async def search_memory_nodes(
 ) -> NodeSearchResponse | ErrorResponse:
     """Search the graph memory for relevant node summaries using advanced hybrid search.
     These contain a summary of all of a node's relationships with other nodes.
-    
-    Uses sophisticated search methodologies including BM25, cosine similarity, and adaptive 
+
+    Uses sophisticated search methodologies including BM25, cosine similarity, and adaptive
     reranking strategies:
     - Cross-encoder reranking (when available) for highest quality semantic relevance
     - Node distance reranking when centering around a specific node
     - RRF (Reciprocal Rank Fusion) as a fast fallback for hybrid search
-    
-    The search automatically detects available reranking capabilities and selects the 
+
+    The search automatically detects available reranking capabilities and selects the
     optimal configuration for best results.
 
     Args:
@@ -969,10 +885,10 @@ async def search_memory_nodes(
         max_nodes: Maximum number of nodes to return (default: 10)
         center_node_uuid: Optional UUID of a node to center the search around (enables proximity-based reranking)
         entity: Optional entity type filter. Valid types: "Requirement", "Preference", "Procedure"
-        
+
     Returns:
         NodeSearchResponse with matching nodes and their summaries, or ErrorResponse on failure
-        
+
     Raises:
         ErrorResponse: If entity type is invalid or if Graphiti client is not initialized
     """
@@ -998,11 +914,11 @@ async def search_memory_nodes(
                 suggestion = ' Did you mean "Procedure"?'
             elif entity.lower() in ['req', 'requirement', 'requirements']:
                 suggestion = ' Did you mean "Requirement"?'
-                
+
             return ErrorResponse(
                 error=f'Invalid entity type "{entity}". Available types: {available_types}.{suggestion}'
             )
-        
+
         # Handle entity filtering with graceful degradation
         entity_filter_warning = None
         if entity is not None and not config.use_custom_entities:
@@ -1028,10 +944,10 @@ async def search_memory_nodes(
         # Configure the search with intelligent strategy selection
         # Check if cross-encoder is available by verifying if graphiti client has a cross_encoder
         has_cross_encoder = (
-            hasattr(client, 'cross_encoder') and 
+            hasattr(client, 'cross_encoder') and
             client.cross_encoder is not None
         )
-        
+
         # Smart search configuration selection based on context and available capabilities
         if center_node_uuid is not None:
             # Use node distance reranking when centering around a specific node for proximity-based results
@@ -1045,15 +961,15 @@ async def search_memory_nodes(
             # Fallback to RRF for fast hybrid search when cross-encoder unavailable
             search_config = NODE_HYBRID_SEARCH_RRF.model_copy(deep=True)
             search_strategy = "RRF hybrid (fast)"
-        
+
         search_config.limit = max_nodes
-        
+
         logger.debug(f'Search config: {search_strategy}, entity_filter: {entity}, groups: {effective_group_ids}')
 
         # Perform the search using the search_ method with timing
         import time
         start_time = time.time()
-        
+
         search_results = await client.search_(
             query=query,
             config=search_config,
@@ -1061,10 +977,10 @@ async def search_memory_nodes(
             center_node_uuid=center_node_uuid,
             search_filter=filters,
         )
-        
+
         search_duration = time.time() - start_time
         logger.info(f'Search completed: {len(search_results.nodes)} nodes found in {search_duration:.2f}s using {search_strategy}')
-        
+
         # Enhanced logging for debugging entity filtering
         if entity is not None and len(search_results.nodes) == 0:
             logger.warning(f'Entity filter "{entity}" returned no results. Suggestions:\n'
@@ -1076,7 +992,7 @@ async def search_memory_nodes(
             for node in search_results.nodes:
                 entity_types_found.update([label for label in node.labels if label != 'Entity'])
             logger.debug(f'Entity types in results: {list(entity_types_found)}')
-            
+
         if not search_results.nodes:
             suggestion_msg = "No relevant nodes found"
             if entity is not None:
@@ -1103,7 +1019,7 @@ async def search_memory_nodes(
             response_message = f'⚠️ {entity_filter_warning} Found {len(formatted_nodes)} nodes.'
         elif len(formatted_nodes) > 0:
             response_message = f'Found {len(formatted_nodes)} nodes'
-            
+
         return NodeSearchResponse(message=response_message, nodes=formatted_nodes)
     except Exception as e:
         error_msg = str(e)
@@ -1315,56 +1231,56 @@ async def list_node_labels(
     limit: int = 50
 ) -> dict[str, Any] | ErrorResponse:
     """List existing nodes with their labels for debugging entity filtering.
-    
+
     This tool helps diagnose why entity filtering might not be working by showing
     what labels are actually stored in the database, with optional filtering and statistics.
-    
+
     Args:
         group_id: Optional group ID to filter results. If not provided, uses default group_id.
         entity_type: Optional entity type to filter by (e.g., "Requirement", "Preference", "Procedure")
         limit: Maximum number of nodes to return (default: 50, max: 200)
-        
+
     Returns:
         Dictionary with node information, entity type counts, and metadata
     """
     global graphiti_client
-    
+
     if graphiti_client is None:
         return ErrorResponse(error='Graphiti client not initialized')
-    
+
     try:
         # Validate inputs
         if limit > 200:
             limit = 200
         if limit < 1:
             limit = 50
-            
+
         # Validate entity_type if provided
         if entity_type is not None and entity_type not in ENTITY_TYPES:
             available_types = ', '.join(f'"{t}"' for t in ENTITY_TYPES)
             return ErrorResponse(
                 error=f'Invalid entity_type "{entity_type}". Available types: {available_types}'
             )
-        
+
         # Use the provided group_id or fall back to the default from config
         effective_group_id = group_id if group_id is not None else config.group_id
-        
+
         if not isinstance(effective_group_id, str):
             return ErrorResponse(error='Group ID must be a string')
-        
+
         # We've already checked that graphiti_client is not None above
         assert graphiti_client is not None
-        
+
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
-        
+
         # Get filtered nodes - handle entity_type filtering via WHERE clause to avoid f-string
         if entity_type is not None:
             records, _, _ = await client.driver.execute_query(
                 """
                 MATCH (n:Entity {group_id: $group_id})
                 WHERE $entity_type IN labels(n)
-                RETURN n.uuid as uuid, n.name as name, labels(n) as labels, 
+                RETURN n.uuid as uuid, n.name as name, labels(n) as labels,
                        n.created_at as created_at, n.summary as summary
                 ORDER BY n.created_at DESC
                 LIMIT $limit
@@ -1378,7 +1294,7 @@ async def list_node_labels(
             records, _, _ = await client.driver.execute_query(
                 """
                 MATCH (n:Entity {group_id: $group_id})
-                RETURN n.uuid as uuid, n.name as name, labels(n) as labels, 
+                RETURN n.uuid as uuid, n.name as name, labels(n) as labels,
                        n.created_at as created_at, n.summary as summary
                 ORDER BY n.created_at DESC
                 LIMIT $limit
@@ -1387,7 +1303,7 @@ async def list_node_labels(
                 limit=limit,
                 routing_='r'
             )
-        
+
         # Get entity type counts
         count_records, _, _ = await client.driver.execute_query(
             """
@@ -1400,7 +1316,7 @@ async def list_node_labels(
             group_id=effective_group_id,
             routing_='r'
         )
-        
+
         entity_counts = {}
         total_nodes = 0
         for record in count_records:
@@ -1408,7 +1324,7 @@ async def list_node_labels(
             count = record['count']
             entity_counts[entity_type_name] = count
             total_nodes += count
-        
+
         nodes_info = []
         for record in records:
             # Extract entity types (exclude 'Entity' base label)
@@ -1421,9 +1337,9 @@ async def list_node_labels(
                 'created_at': record['created_at'].isoformat() if record['created_at'] else None,
                 'summary': record['summary'][:100] + '...' if record['summary'] and len(record['summary']) > 100 else record['summary']
             })
-        
+
         filter_msg = f" matching entity type '{entity_type}'" if entity_type else ""
-        
+
         return {
             'message': f'Found {len(nodes_info)} nodes{filter_msg} in group {effective_group_id} (showing up to {limit})',
             'nodes': nodes_info,
@@ -1432,7 +1348,7 @@ async def list_node_labels(
             'custom_entities_enabled': config.use_custom_entities,
             'filter_applied': entity_type
         }
-        
+
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error listing node labels: {error_msg}')
@@ -1466,7 +1382,7 @@ async def clear_graph() -> SuccessResponse | ErrorResponse:
 
 @mcp.resource('http://graphiti/status')
 async def get_status() -> StatusResponse:
-    """Get the status of the Graphiti MCP server and Neo4j connection."""
+    """Get the status of the Graphiti MCP server and FalkorDB connection."""
     global graphiti_client
 
     if graphiti_client is None:
@@ -1479,25 +1395,26 @@ async def get_status() -> StatusResponse:
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
 
-        # Test database connection
-        await client.driver.client.verify_connectivity()  # type: ignore
+        # Test database connection - FalkorDB doesn't have verify_connectivity, so we'll do a simple query
+        # Try to check if the database is responsive by attempting a simple query
+        await client.driver.execute_query("RETURN 1", routing_='r')
 
         return StatusResponse(
-            status='ok', message='Graphiti MCP server is running and connected to Neo4j'
+            status='ok', message='Graphiti MCP server is running and connected to FalkorDB'
         )
     except Exception as e:
         error_msg = str(e)
-        logger.error(f'Error checking Neo4j connection: {error_msg}')
+        logger.error(f'Error checking FalkorDB connection: {error_msg}')
         return StatusResponse(
             status='error',
-            message=f'Graphiti MCP server is running but Neo4j connection failed: {error_msg}',
+            message=f'Graphiti MCP server is running but FalkorDB connection failed: {error_msg}',
         )
 
 
 def configure_mcp_server(mcp_config: MCPConfig) -> None:
     """Configure the FastMCP server with the given configuration."""
     global mcp
-    
+
     # Configure for streamable-http if needed
     if mcp_config.transport == 'streamable-http':
         # Note: These attributes may not be available in all FastMCP versions
@@ -1535,6 +1452,26 @@ async def initialize_server() -> MCPConfig:
         '--temperature',
         type=float,
         help='Temperature setting for the LLM (0.0-2.0). Lower values make output more deterministic. (default: 0.7)',
+    )
+    parser.add_argument(
+        '--openrouter-provider-order',
+        help='Comma-separated list of preferred providers (e.g., "anthropic,openai,google"). Controls routing priority.',
+    )
+    parser.add_argument(
+        '--openrouter-allow-fallbacks',
+        action='store_true',
+        default=True,
+        help='Allow fallback to other providers if primary providers fail (default: true)',
+    )
+    parser.add_argument(
+        '--openrouter-no-fallbacks',
+        action='store_true',
+        help='Disable fallbacks to other providers',
+    )
+    parser.add_argument(
+        '--openrouter-provider-sort',
+        choices=['price', 'throughput', 'latency'],
+        help='Sort providers by price, throughput, or latency',
     )
     parser.add_argument('--destroy-graph', action='store_true', help='Destroy all Graphiti graphs')
     parser.add_argument(
@@ -1583,10 +1520,10 @@ async def initialize_server() -> MCPConfig:
 
     # Create MCP configuration
     mcp_config = MCPConfig.from_cli(args)
-    
+
     # Configure MCP server with settings
     configure_mcp_server(mcp_config)
-    
+
     # Initialize Graphiti
     await initialize_graphiti()
 
@@ -1594,7 +1531,7 @@ async def initialize_server() -> MCPConfig:
     if args.host:
         logger.info(f'Setting MCP server host to: {args.host}')
         mcp.settings.host = args.host
-    
+
     if args.port:
         logger.info(f'Setting MCP server port to: {args.port}')
         mcp.settings.port = args.port

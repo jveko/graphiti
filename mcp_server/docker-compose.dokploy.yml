@@ -24,8 +24,8 @@ services:
   graphiti-mcp:
     image: zepai/knowledge-graph-mcp:latest
     build:
-      context: .
-      dockerfile: Dockerfile-new
+      context: ..
+      dockerfile: mcp_server/Dockerfile-new
     env_file:
       - .env
     depends_on:

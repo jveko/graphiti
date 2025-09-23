@@ -7,6 +7,5 @@ requires-python = ">=3.10,<4"
 dependencies = [
     "mcp>=1.12.3",
     "openai>=1.98.0",
-    "azure-identity>=1.23.1",
-    "graphiti-core[voyageai,google-genai]",
+    "graphiti-core[voyageai,google-genai,falkordb]",
 ]

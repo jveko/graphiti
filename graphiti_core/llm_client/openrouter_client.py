@@ -89,10 +89,17 @@ class OpenRouterClient(LLMClient):
 
         return provider_config if provider_config else None
 
+    def _is_openrouter_provider(self) -> bool:
+        """Check if we're using OpenRouter (not direct provider through OpenRouter)."""
+        base_url = getattr(self.client, 'base_url', None)
+        if base_url:
+            return 'openrouter.ai' in str(base_url)
+        return False
+
     def _build_response_format(self, response_model: type[BaseModel] | None = None) -> dict[str, typing.Any]:
-        """Build the response format for OpenRouter structured output."""
-        if response_model is not None:
-            # Use OpenRouter's structured output format
+        """Build the response format - use structured output only for OpenRouter."""
+        if response_model is not None and self._is_openrouter_provider():
+            # Use OpenRouter's structured output format only when using OpenRouter
             schema = response_model.model_json_schema()
             return {
                 'type': 'json_schema',
@@ -103,7 +110,7 @@ class OpenRouterClient(LLMClient):
                 }
             }
         else:
-            # Fallback to simple JSON object
+            # Fallback to simple JSON object for non-OpenRouter or no response_model
             return {'type': 'json_object'}
 
     async def _generate_response(
@@ -137,7 +144,8 @@ class OpenRouterClient(LLMClient):
                 request_params['provider'] = provider_config
                 logger.debug(f'Using OpenRouter provider config: {provider_config}')
 
-            logger.debug(f'OpenRouter request with response_format: {request_params["response_format"]}')
+            is_structured = response_model is not None and self._is_openrouter_provider()
+            logger.debug(f'OpenRouter request - Structured output: {is_structured}, Format: {request_params["response_format"]}')
             response = await self.client.chat.completions.create(**request_params)
             result = response.choices[0].message.content or ''
             return json.loads(result)

@@ -33,10 +33,6 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
-# Copy the entire parent project to include graphiti_core
-COPY .. /workspace
-RUN cp -r /workspace/graphiti_core /app/
-
 # Copy application code
 COPY graphiti_mcp_server_new.py ./
 

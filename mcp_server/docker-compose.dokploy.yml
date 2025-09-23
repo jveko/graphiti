@@ -2,14 +2,18 @@ services:
   falkordb:
     image: falkordb/falkordb:latest
     ports:
-      - "6379:6379" # Redis protocol port
-      - "3000:3000" # Web interface port
+      - "6379" # Redis protocol port
+      - "3000" # Web interface port
     environment:
       - REDIS_ARGS=${FALKORDB_PASSWORD:+--requirepass $FALKORDB_PASSWORD}
     volumes:
       - falkordb_data:/var/lib/falkordb/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ${FALKORDB_PASSWORD:+-a $FALKORDB_PASSWORD} ping"]
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli ${FALKORDB_PASSWORD:+-a $FALKORDB_PASSWORD} ping",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5

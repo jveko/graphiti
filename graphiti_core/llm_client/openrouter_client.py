@@ -59,7 +59,17 @@ class OpenRouterClient(LLMClient):
 
         super().__init__(config, cache)
 
-        self.client = AsyncOpenAI(api_key=config.api_key, base_url=config.base_url)
+        # Add OpenRouter app attribution headers
+        default_headers = {
+            "HTTP-Referer": "https://github.com/getzep/graphiti",
+            "X-Title": "Graphiti Knowledge Graph"
+        }
+
+        self.client = AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            default_headers=default_headers
+        )
         self.provider_order = provider_order
         self.allow_fallbacks = allow_fallbacks
         self.provider_sort = provider_sort

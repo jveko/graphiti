@@ -26,8 +26,11 @@ ENV UV_COMPILE_BYTECODE=1 \
 # Create non-root user
 RUN groupadd -r app && useradd -r -d /app -g app app
 
-# Copy parent project for local graphiti-core
-COPY .. /workspace
+# Copy parent project structure for local graphiti-core (excluding mcp_server)
+COPY ../graphiti_core /workspace/graphiti_core
+COPY ../pyproject.toml /workspace/pyproject.toml
+COPY ../README.md /workspace/README.md
+COPY ../uv.lock /workspace/uv.lock
 
 # Copy project files for dependency installation (better caching)
 COPY pyproject.toml uv.lock ./

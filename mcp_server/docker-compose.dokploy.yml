@@ -4,16 +4,11 @@ services:
     ports:
       - "6379" # Redis protocol port
       - "3000" # Web interface port
-    environment:
-      - REDIS_ARGS=${FALKORDB_PASSWORD:+--requirepass $FALKORDB_PASSWORD}
+    environment: []
     volumes:
       - falkordb_data:/var/lib/falkordb/data
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "redis-cli ${FALKORDB_PASSWORD:+-a $FALKORDB_PASSWORD} ping",
-        ]
+      test: ["CMD-SHELL", "redis-cli ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -34,8 +29,6 @@ services:
     environment:
       - FALKORDB_HOST=${FALKORDB_HOST:-falkordb}
       - FALKORDB_PORT=${FALKORDB_PORT:-6379}
-      - FALKORDB_USERNAME=${FALKORDB_USERNAME:-}
-      - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
       - FALKORDB_DATABASE=${FALKORDB_DATABASE:-default_db}
     ports:
       - "3000" # Expose the MCP server via HTTP for SSE transport

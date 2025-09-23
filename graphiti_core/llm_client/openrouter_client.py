@@ -89,6 +89,23 @@ class OpenRouterClient(LLMClient):
 
         return provider_config if provider_config else None
 
+    def _build_response_format(self, response_model: type[BaseModel] | None = None) -> dict[str, typing.Any]:
+        """Build the response format for OpenRouter structured output."""
+        if response_model is not None:
+            # Use OpenRouter's structured output format
+            schema = response_model.model_json_schema()
+            return {
+                'type': 'json_schema',
+                'json_schema': {
+                    'name': response_model.__name__,
+                    'strict': True,
+                    'schema': schema
+                }
+            }
+        else:
+            # Fallback to simple JSON object
+            return {'type': 'json_object'}
+
     async def _generate_response(
         self,
         messages: list[Message],
@@ -105,13 +122,13 @@ class OpenRouterClient(LLMClient):
                 openai_messages.append({'role': 'system', 'content': m.content})
 
         try:
-            # Build the request parameters
+            # Build the request parameters with proper structured output format
             request_params = {
                 'model': self.model or DEFAULT_MODEL,
                 'messages': openai_messages,
                 'temperature': self.temperature,
                 'max_tokens': self.max_tokens,
-                'response_format': {'type': 'json_object'},
+                'response_format': self._build_response_format(response_model),
             }
 
             # Add provider routing configuration if specified
@@ -120,6 +137,7 @@ class OpenRouterClient(LLMClient):
                 request_params['provider'] = provider_config
                 logger.debug(f'Using OpenRouter provider config: {provider_config}')
 
+            logger.debug(f'OpenRouter request with response_format: {request_params["response_format"]}')
             response = await self.client.chat.completions.create(**request_params)
             result = response.choices[0].message.content or ''
             return json.loads(result)

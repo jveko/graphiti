@@ -1357,7 +1357,7 @@ async def list_node_labels(
                 'name': record['name'],
                 'labels': record['labels'],
                 'entity_types': entity_labels,
-                'created_at': record['created_at'].isoformat() if record['created_at'] else None,
+                'created_at': record['created_at'] if isinstance(record['created_at'], str) else (record['created_at'].isoformat() if record['created_at'] else None),
                 'summary': record['summary'][:100] + '...' if record['summary'] and len(record['summary']) > 100 else record['summary']
             })
 

@@ -48,7 +48,7 @@ class VoyageRerankerClient(CrossEncoderClient):
         self,
         api_key: str | None = None,
         model: str = DEFAULT_MODEL,
-        client: 'voyageai.Client | None' = None,
+        client: 'voyageai.AsyncClient | None' = None,
     ):
         """
         Initialize the VoyageRerankerClient with the provided configuration and client.
@@ -59,14 +59,14 @@ class VoyageRerankerClient(CrossEncoderClient):
             model (str): The reranking model to use. 
                         Options: rerank-2.5, rerank-2.5-lite, rerank-2, rerank-2-lite, rerank-1.
                         Defaults to 'rerank-2.5'.
-            client (voyageai.Client | None): An optional Voyage AI client instance to use. 
-                                            If not provided, a new client is created.
+            client (voyageai.AsyncClient | None): An optional Voyage AI async client instance to use.
+                                                 If not provided, a new async client is created.
         """
         self.api_key = api_key
         self.model = model
         
         if client is None:
-            self.client = voyageai.Client(api_key=api_key)
+            self.client = voyageai.AsyncClient(api_key=api_key)
         else:
             self.client = client
 
@@ -90,7 +90,7 @@ class VoyageRerankerClient(CrossEncoderClient):
 
         try:
             # Use Voyage AI rerank API
-            reranking_result = self.client.rerank(
+            reranking_result = await self.client.rerank(
                 query=query,
                 documents=passages,
                 model=self.model,

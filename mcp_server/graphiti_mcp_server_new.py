@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import logging
 import os
+import random
 import sys
 from datetime import datetime, timezone
 from typing import Any, TypedDict, cast
@@ -47,6 +48,12 @@ DEFAULT_EMBEDDER_MODEL = 'text-embedding-3-small'
 # Decrease this if you're experiencing 429 rate limit errors from your LLM provider.
 # Increase if you have high rate limits.
 SEMAPHORE_LIMIT = int(os.getenv('SEMAPHORE_LIMIT', 10))
+
+# Retry configuration for episode processing
+MAX_RETRY_ATTEMPTS = int(os.getenv('MAX_RETRY_ATTEMPTS', 2))
+RETRY_BASE_DELAY = float(os.getenv('RETRY_BASE_DELAY', 1.0))
+RETRY_MAX_DELAY = float(os.getenv('RETRY_MAX_DELAY', 60.0))
+RETRY_JITTER = os.getenv('RETRY_JITTER', 'true').lower() == 'true'
 
 
 class Requirement(BaseModel):
@@ -703,6 +710,78 @@ def format_fact_result(edge: EntityEdge) -> dict[str, Any]:
     return result
 
 
+def is_retryable_error(error: Exception) -> bool:
+    """Determine if an error is retryable based on its type and characteristics.
+
+    Args:
+        error: The exception to classify
+
+    Returns:
+        bool: True if the error should be retried, False otherwise
+    """
+    # Network and connection errors - usually retryable
+    if isinstance(error, (
+        asyncio.TimeoutError,
+        ConnectionError,
+        ConnectionResetError,
+        ConnectionAbortedError,
+        OSError,
+    )):
+        return True
+
+    # Check for HTTP errors if available
+    if hasattr(error, 'status_code'):
+        status_code = getattr(error, 'status_code', None)
+        if status_code:
+            # 5xx server errors and 429 rate limits are retryable
+            # 4xx client errors (except rate limits) are not retryable
+            return status_code >= 500 or status_code == 429
+
+    # Rate limit errors (various forms)
+    error_msg = str(error).lower()
+    if any(keyword in error_msg for keyword in [
+        'rate limit', 'too many requests', 'quota exceeded', 'throttled'
+    ]):
+        return True
+
+    # Temporary service unavailable errors
+    if any(keyword in error_msg for keyword in [
+        'service unavailable', 'temporarily unavailable', 'overloaded'
+    ]):
+        return True
+
+    # Authentication and validation errors are not retryable
+    if any(keyword in error_msg for keyword in [
+        'authentication', 'unauthorized', 'invalid api key', 'permission denied',
+        'validation error', 'invalid input', 'bad request'
+    ]):
+        return False
+
+    # Default to not retryable for unknown errors to avoid infinite loops
+    return False
+
+
+def calculate_retry_delay(attempt: int) -> float:
+    """Calculate the delay for a retry attempt using exponential backoff with jitter.
+
+    Args:
+        attempt: The current attempt number (0-based)
+
+    Returns:
+        float: The delay in seconds
+    """
+    # Exponential backoff: base_delay * (2 ^ attempt)
+    delay = RETRY_BASE_DELAY * (2 ** attempt)
+
+    # Add jitter to prevent thundering herd
+    if RETRY_JITTER:
+        jitter_range = delay * 0.1  # 10% jitter
+        delay += random.uniform(-jitter_range, jitter_range)
+
+    # Cap at maximum delay
+    return min(delay, RETRY_MAX_DELAY)
+
+
 # Dictionary to store queues for each group_id
 # Each queue is a list of tasks to be processed sequentially
 episode_queues: dict[str, asyncio.Queue] = {}
@@ -835,31 +914,55 @@ async def add_memory(
         # Use cast to help the type checker understand that graphiti_client is not None
         client = cast(Graphiti, graphiti_client)
 
-        # Define the episode processing function
+        # Define the episode processing function with retry logic
         async def process_episode():
-            try:
-                logger.info(f"Processing queued episode '{name}' for group_id: {group_id_str}")
-                # Use all entity types if use_custom_entities is enabled, otherwise use empty dict
-                entity_types = ENTITY_TYPES if config.use_custom_entities else {}
+            attempt = 0
+            last_error = None
 
-                await client.add_episode(
-                    name=name,
-                    episode_body=episode_body,
-                    source=source_type,
-                    source_description=source_description,
-                    group_id=group_id_str,  # Using the string version of group_id
-                    uuid=uuid,
-                    reference_time=datetime.now(timezone.utc),
-                    entity_types=entity_types,
-                )
-                logger.info(f"Episode '{name}' added successfully")
+            while attempt <= MAX_RETRY_ATTEMPTS:
+                try:
+                    if attempt > 0:
+                        logger.info(f"Retrying episode '{name}' for group_id {group_id_str} (attempt {attempt + 1}/{MAX_RETRY_ATTEMPTS + 1})")
+                    else:
+                        logger.info(f"Processing queued episode '{name}' for group_id: {group_id_str}")
 
-                logger.info(f"Episode '{name}' processed successfully")
-            except Exception as e:
-                error_msg = str(e)
-                logger.error(
-                    f"Error processing episode '{name}' for group_id {group_id_str}: {error_msg}"
-                )
+                    # Use all entity types if use_custom_entities is enabled, otherwise use empty dict
+                    entity_types = ENTITY_TYPES if config.use_custom_entities else {}
+
+                    await client.add_episode(
+                        name=name,
+                        episode_body=episode_body,
+                        source=source_type,
+                        source_description=source_description,
+                        group_id=group_id_str,  # Using the string version of group_id
+                        uuid=uuid,
+                        reference_time=datetime.now(timezone.utc),
+                        entity_types=entity_types,
+                    )
+
+                    logger.info(f"Episode '{name}' processed successfully" + (f" after {attempt} retries" if attempt > 0 else ""))
+                    return  # Success - exit retry loop
+
+                except Exception as e:
+                    last_error = e
+                    error_msg = str(e)
+
+                    # Check if this error is retryable
+                    if not is_retryable_error(e):
+                        logger.error(f"Non-retryable error processing episode '{name}' for group_id {group_id_str}: {error_msg}")
+                        return  # Don't retry non-retryable errors
+
+                    # Check if we've exhausted retries
+                    if attempt >= MAX_RETRY_ATTEMPTS:
+                        logger.error(f"Failed to process episode '{name}' for group_id {group_id_str} after {MAX_RETRY_ATTEMPTS + 1} attempts. Final error: {error_msg}")
+                        return  # Give up after max retries
+
+                    # Calculate delay and wait before retry
+                    delay = calculate_retry_delay(attempt)
+                    logger.warning(f"Retryable error processing episode '{name}' for group_id {group_id_str}: {error_msg}. Retrying in {delay:.2f}s")
+
+                    await asyncio.sleep(delay)
+                    attempt += 1
 
         # Initialize queue for this group_id if it doesn't exist
         if group_id_str not in episode_queues:

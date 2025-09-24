@@ -538,6 +538,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Reduce verbosity of external libraries
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('voyage').setLevel(logging.WARNING)
+logging.getLogger('mcp.server.lowlevel.server').setLevel(logging.WARNING)
+logging.getLogger('graphiti_core.graphiti').setLevel(logging.INFO)
+
 # Create global config instance - will be properly initialized later
 config = GraphitiConfig()
 

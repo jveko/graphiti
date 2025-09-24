@@ -61,7 +61,7 @@ def get_default_group_id(provider: GraphProvider) -> str:
 
 def lucene_sanitize(query: str) -> str:
     # Escape special characters from a query before passing into Lucene
-    # + - && || ! ( ) { } [ ] ^ " ~ * ? : \ /
+    # + - && || ! ( ) { } [ ] ^ " ~ * ? : \ / $
     escape_map = str.maketrans(
         {
             '+': r'\+',
@@ -83,6 +83,7 @@ def lucene_sanitize(query: str) -> str:
             ':': r'\:',
             '\\': r'\\',
             '/': r'\/',
+            '$': r'\$',  # Add $ character escaping for RediSearch
             'O': r'\O',
             'R': r'\R',
             'N': r'\N',

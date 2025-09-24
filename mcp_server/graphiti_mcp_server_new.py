@@ -25,6 +25,7 @@ from graphiti_core.embedder.voyage import VoyageAIEmbedder, VoyageAIEmbedderConf
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig
 from graphiti_core.llm_client.gemini_client import GeminiClient
+from graphiti_core.llm_client.groq_client import GroqClient
 from graphiti_core.llm_client.openai_client import OpenAIClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.search.search_config_recipes import (
@@ -194,7 +195,8 @@ class GraphitiLLMConfig(BaseModel):
     openrouter_provider_order: list[str] | None = None
     openrouter_allow_fallbacks: bool = True
     openrouter_provider_sort: str | None = None  # 'price', 'throughput', 'latency'
-    llm_provider: str | None = None  # 'gemini', 'openrouter', or 'openai'
+    groq_api_key: str | None = None
+    llm_provider: str | None = None  # 'gemini', 'openrouter', 'groq', or 'openai'
 
     @classmethod
     def from_env(cls) -> 'GraphitiLLMConfig':
@@ -242,6 +244,18 @@ class GraphitiLLMConfig(BaseModel):
                 small_model=small_model,
                 temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
                 llm_provider='openrouter',
+            )
+
+        # Check for Groq API key third
+        groq_api_key = os.environ.get('GROQ_API_KEY', None)
+        if groq_api_key:
+            # Groq takes precedence over OpenAI if API key is set
+            return cls(
+                groq_api_key=groq_api_key,
+                model=model,
+                small_model=small_model,
+                temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+                llm_provider='groq',
             )
 
         # Setup for OpenAI API (default fallback)
@@ -333,6 +347,15 @@ class GraphitiLLMConfig(BaseModel):
                 allow_fallbacks=self.openrouter_allow_fallbacks,
                 provider_sort=self.openrouter_provider_sort,
             )
+        elif self.llm_provider == 'groq' and self.groq_api_key:
+            # Groq setup
+            llm_client_config = LLMConfig(
+                api_key=self.groq_api_key,
+                model=self.model,
+                small_model=self.small_model,
+                temperature=self.temperature,
+            )
+            return GroqClient(config=llm_client_config)
 
         if not self.api_key:
             raise ValueError('OPENAI_API_KEY must be set when using OpenAI API')

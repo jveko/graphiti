@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Install local graphiti-core with required extras
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install /workspace[voyageai,falkordb,groq]
+    uv pip install /workspace[voyageai,google-genai,falkordb,groq]
 
 # Copy application code
 COPY mcp_server/graphiti_mcp_server_new.py ./

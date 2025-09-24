@@ -45,7 +45,6 @@ logger = logging.getLogger(__name__)
 # Updated to latest Groq models as of 2025
 DEFAULT_MODEL = 'llama-3.3-70b-versatile'
 DEFAULT_SMALL_MODEL = 'llama-3.1-8b-instant'
-DEFAULT_LARGE_MODEL = 'mixtral-8x7b-32768'
 DEFAULT_MAX_TOKENS = 2048
 MAX_RETRIES = 2
 
@@ -89,8 +88,6 @@ class GroqClient(LLMClient):
         """Get the appropriate Groq model based on the requested size."""
         if model_size == ModelSize.small:
             return self.small_model or DEFAULT_SMALL_MODEL
-        elif model_size == ModelSize.large:
-            return DEFAULT_LARGE_MODEL  # Use high-capacity model for large tasks
         else:
             return self.model or DEFAULT_MODEL
 

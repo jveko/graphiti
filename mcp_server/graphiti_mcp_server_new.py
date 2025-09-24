@@ -502,7 +502,8 @@ class GraphitiConfig(BaseModel):
         if args.group_id:
             config.group_id = args.group_id
         else:
-            config.group_id = 'default'
+            # Check environment variable first, fallback to 'default'
+            config.group_id = os.environ.get('GROUP_ID', 'default')
 
         config.use_custom_entities = args.use_custom_entities
         config.destroy_graph = args.destroy_graph

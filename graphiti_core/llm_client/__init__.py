@@ -17,7 +17,8 @@ limitations under the License.
 from .client import LLMClient
 from .config import LLMConfig
 from .errors import RateLimitError
+from .groq_client import GroqClient
 from .openai_client import OpenAIClient
 from .openrouter_client import OpenRouterClient
 
-__all__ = ['LLMClient', 'OpenAIClient', 'OpenRouterClient', 'LLMConfig', 'RateLimitError']
+__all__ = ['LLMClient', 'OpenAIClient', 'OpenRouterClient', 'GroqClient', 'LLMConfig', 'RateLimitError']
